@@ -1,0 +1,157 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+## Analysis of RNA-seq data from raw counts 
+
+Here we use data from [this study](https://www.sciencedirect.com/science/article/pii/S2211124720300358#bib45), deposited to the GEO database under the accession number [GSE130629](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE130629). 
+
+First install BiocManager, then use it to install the necessary packages (GEOquery, edgeR)
+Install some other necessary packages for analysis & visualization
+```{r}
+#install.packages("BiocManager")
+#BiocManager::install("GEOquery")
+library(GEOquery)
+
+library(stringr)
+
+library(limma)
+#BiocManager::install("edgeR")
+library(edgeR)
+
+library(ggplot2)
+
+# set the working directory
+setwd('D:/defne/Documents/BC/TVO/RNAseq/HOST_ENTROPY/Dataset1_Mouse_EBOV/')
+```
+
+Download the GEO data file, put it in the current directory, and load it . 
+GSE files are composites of GSM (accessions of each individual sample) and GPL (platform - specifying the microarray type or organism)
+```{r}
+Mm_ebov_dat <- getGEO('GSE130629', destdir=".", GSEMatrix = TRUE)
+# get the metadata associated with these samples
+metadata_table <- pData(phenoData(Mm_ebov_dat[[1]]))
+```
+Unfortunately this imports no expression data - this can be seen by printing a summary of the Mm_ebov_dat object (assayData has 0 rows)
+```{r}
+Mm_ebov_dat
+```
+
+The raw read counts for each gene/feature is provided as a supplemental table on GEO. Download the file "GSE130629_TCC_master_count_1-370.txt.gz" and move to the current directory and unzip. Then we can load the counts from this table
+```{r}
+Mm_ebov_counts <- read.table('GSE130629_TCC_master_count_1-370.txt', sep="\t", header=T, row.names = 1)
+
+# only keep genes (i.e. rows) for which there is more than 100 counts across all experiments
+Mm_ebov_counts <- Mm_ebov_counts[rowSums(Mm_ebov_counts)>100, ]
+```
+
+Now we retrieve the relevant columns in the metadata table (those that specify the animal, strain, timepoint, infection, tissue information etc), and include the samples that use mRNA (rather than miRNA). Since this step is more of a "manual" curation of the data, inspect the metadata, check the study, and make the most appropriate decision for the particular dataset you are working with. 
+```{r}
+## get the relevant columns after checking metadata_table
+metadata_sub <- metadata_table[,c('title', 'geo_accession', "animal id:ch1","cc line:ch1",
+                                  "day post-infection:ch1", "infection condtion:ch1", "tissue:ch1")]
+# some of the samples are miRNA (we only want normal mRNA results), so exclude those based on the 
+metadata_sub <- metadata_sub[grepl('miRNA', metadata_sub$title) == FALSE,]
+
+```
+
+The column names are "TCC_NNNN" in Mm_ebov_counts. However, the "title" column in metadata_sub contains the sample information, but as "TCC_N: ...". So we need to match these up by changing the string formatting a little. 
+We take the title string, find the number between "-" and ":", and pad it with 0's to make a 4 character string, then paste it to "TCC_", that should match the column names on Mm_ebov_counts. 
+
+```{r}
+x <- sapply(as.character(metadata_sub$title), function(i){unlist(strsplit(i, split=":",fixed=T))[1]})
+x <- sapply(x, function(i){unlist(strsplit(i, split="-",fixed=T))[2]})
+
+x_padded <- str_pad(x, 4, pad = "0")
+metadata_sub['OldColumnName'] <- paste0("TCC_", x_padded)
+```
+
+## Infection vs Mock comparisons
+Here we will look at differential expression for each strain, each timepoint and each tissue; comparing EBOV-infected samples to mock infection controls.
+First, we make a custom function for the appropriate comparison, then apply this function to all timepoints, tissues and strains. 
+```{r}
+N <- nrow(Mm_ebov_counts)
+
+DE_entropy_treatment <- function(mystrain, mytissue, myDPI){
+  # define the experimental and control groups (DE will be computed as Experiment/Control)
+  infectedgroup <- metadata_sub[(metadata_sub$`infection condtion:ch1` == "MA-EBOV infected" & 
+                                metadata_sub$`cc line:ch1` == mystrain & 
+                                metadata_sub$`tissue:ch1` == mytissue & 
+                                metadata_sub$`day post-infection:ch1` == myDPI), ]
+
+  controlgroup <- metadata_sub[(metadata_sub$`infection condtion:ch1` == "Mock" & 
+                                metadata_sub$`cc line:ch1` == mystrain & 
+                                metadata_sub$`tissue:ch1` == mytissue & 
+                                metadata_sub$`day post-infection:ch1` == myDPI), ]
+  # make a data frame that has the groups labeles as 1 and 0
+  infectedgroup$Group <- 1
+  controlgroup$Group <- 0
+  designdf <- rbind(infectedgroup, controlgroup)
+  
+  # retrieve the expression data for the relevant samples, and turn into
+  # an expression set
+  exprdata <- Mm_ebov_counts[designdf$OldColumnName]
+  ex <- ExpressionSet(assayData=as.matrix(exprdata))
+  
+  # this next section is from the limma vignettes
+  y <- DGEList(counts = exprdata)
+  y <- calcNormFactors(y)
+  
+  design <- model.matrix(~ Group, data = designdf)
+  v <- voom(y, design, plot=T)
+  fit <- lmFit(v, design)
+  fit <- eBayes(fit)
+  
+  # retrieve the differential expression for all the genes (there's N genes total)
+  DE <- topTable(fit, number = N)$logFC
+  
+  #compute entropy
+  H <- log(2*pi*exp(1)*var(DE, na.rm=T))
+}
+
+# make a data frame with all comparisons that wil be made
+# add an "Entropy" column to store the final data
+allstrains <- unique(metadata_sub$`cc line:ch1`)
+DE_treatment_df <- data.frame('Strain' = rep(allstrains,6),
+                             'Tissue' = c(rep('Spleen',30), rep('Liver', 30)),
+                             'DPI' = rep(c(rep('1',10), rep('3',10), rep('5', 10)),2),
+                             'Entropy'=NA)
+
+# go through the rows and populate the entropy column
+for (i in 1:60){
+  tryCatch({
+      H <- DE_entropy_treatment(DE_treatment_df$Strain[i],DE_treatment_df$Tissue[i],DE_treatment_df$DPI[i])
+      
+      DE_treatment_df$Entropy[i] <- H
+  }, error = function(e) {
+    print(DE_treatment_df[i,])
+  })
+
+  
+}
+```
+
+Add the mortality and lethality data (from supplemental table 1) 
+https://www.cell.com/cms/10.1016/j.celrep.2020.01.026/attachment/f7f549f1-da4e-42ab-a650-194bfe8ed885/mmc1
+
+```{r}
+DE_treatment_df['Mortality'] <- 1
+DE_treatment_df$Mortality[DE_treatment_df$Strain %in% c("CC057/Unc" , "CC065/Unc" )] <- 0.2
+DE_treatment_df$Mortality[DE_treatment_df$Strain %in% c("CC011/Unc","CC021/Unc","CC026/GeniUnc", "CC061/GeniUnc" )] <- 0
+
+DE_treatment_df['Lethal']<-DE_treatment_df$Mortality==1
+
+
+# plot entropy
+ggplot(DE_treatment_df, aes(x=Lethal, y=Entropy, col=Lethal))+geom_jitter(position=position_jitter(0.1))+
+  facet_grid(DPI~Tissue)+theme_bw()+
+  stat_summary(fun.=mean, geom="point", shape=18,
+                 size=3, color="black")
+# save the plot
+ggsave('GSE130629_Entropy_vs_Lethal_DEtreatment.svg', width=6, height=6, units="in")
+
+# save the data frame
+write.csv(DE_treatment_df, 'GSE130629_Entropy_DEtreatment.csv', row.names = F, quote=T)
+```
