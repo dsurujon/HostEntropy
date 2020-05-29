@@ -1,0 +1,122 @@
+---
+title: "DE analysis of human dengue fever microarray data"
+output: 
+  html_document:
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+The raw data (.CEL files) were downloaded from GEO accession GSE18090.
+
+Load needed libraries and sample info (contained in targets.txt), including file names for the raw data:
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+library(Biobase)
+library(limma)
+library(affy)
+library(AnnotationDbi)
+library(hgu133plus2.db)
+library(dplyr)
+library(oligo)
+
+dir()
+targets <- read.delim("targets.txt",row.names = 1)
+head(targets)
+```
+
+Load data (all the necessary normalization steps, plus log transformation, are done by justRMA), and make sure the resulting ExpressionSet is properly formatted:
+```{r message=FALSE, warning=FALSE}
+eset <- justRMA(filenames = targets$FileName)
+colnames(eset) <- row.names(targets)
+exprs(eset)[1:5,1:5]
+```
+
+Plot the normalized and logged expression values for the samples:
+```{r}
+oligo::boxplot(eset)
+```
+
+The samples' expression values are reasonably median-centered and well-normalized, so we can proceed. 
+
+The next step is to translate the probe IDs from the raw .CEL files to usable gene IDs. This is a bit tricky since one probe can map to more than one gene. The collapser function ensures that all the possible gene IDs are combined into one row, so that we have one row in 'mappings' per probe.
+```{r warning=FALSE}
+collapser <- function(x){
+  x %>% unique %>% sort %>% paste(collapse = "|")
+}
+
+mappings <- AnnotationDbi::select(
+  x       = hgu133plus2.db,
+  keys    = rownames(eset),
+  columns = c("PROBEID", "ENSEMBL", "ENTREZID", "SYMBOL"),
+  keytype = "PROBEID"
+) %>%
+  group_by(PROBEID) %>%
+  summarise_each(funs(collapser)) %>%
+  ungroup
+```
+
+Check that the ID translation is successful:
+```{r}
+dim(mappings)
+dim(eset)
+all(mappings$PROBEID == rownames(eset))
+```
+
+Assign the obtained gene IDs to the featureData slot of the ExpressionSet:
+```{r}
+fd <- new("AnnotatedDataFrame",
+          data = data.frame(mappings[, -1], stringsAsFactors = FALSE)
+)
+rownames(fd) <- mappings$PROBEID
+featureData(eset) <- fd
+```
+
+Make the design matrix using the three groups (non-dengue febrile illness, dengue fever, and dengue hemorrhagic fever), and fit an initial linear model:
+```{r}
+Group <- factor(targets$Group, levels = c("ND", "DF", "DHF"))
+design <- model.matrix(~Group + 0, eset)
+fit <- lmFit(eset, design)
+```
+
+Make a contrast matrix to specify the DE comparisons we want (dengue vs. non-dengue, and dengue hemorrhagic vs. non-dengue), and fit a linear model correspondingly:
+```{r}
+cont.matrix <- makeContrasts(GroupDF-GroupND, GroupDHF-GroupND, levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+```
+
+To decide a p-value cutoff for significance, look at the p-values for the control probes, which we expect not to be differentially expressed:
+```{r}
+i <- grep("AFFX",featureNames(eset))
+summary(fit2$F.p.value[i])
+```
+
+None of the control probes have a p-value below 0.01, so this is a safe cutoff to use for significance. Now, determine which genes are significantly up- or down-regulated according to this cutoff:
+```{r}
+results <- classifyTestsF(fit2, p.value=0.01)
+summary(results)
+```
+
+Plot the results, highlighting differentially expressed genes:
+```{r}
+plotMD(fit2,coef=1,status=results[,1],values=c(1,-1),hl.col=c("red","blue"),ylim=c(-3,3))
+plotMD(fit2,coef=2,status=results[,2],values=c(1,-1),hl.col=c("red","blue"),ylim=c(-3,3))
+```
+
+Capture the log fold changes for each comparison:
+```{r}
+DF_FCs <- topTable(fit2,coef="GroupDF - GroupND",n=Inf)$logFC
+DHF_FCs <- topTable(fit2,coef="GroupDHF - GroupND",n=Inf)$logFC
+```
+
+Calculate the entropy for each comparison:
+```{r}
+# DF vs. ND
+0.5*log(2*pi*exp(1)*var(DF_FCs))
+
+# DHF vs. ND
+0.5*log(2*pi*exp(1)*var(DHF_FCs))
+```
+
+The DHF vs. ND comparison has a higher entropy, which agrees with the notion of entropy: DHF is a more severe illness (i.e. greater stress on the host) than DF.
