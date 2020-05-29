@@ -1,0 +1,197 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+## Analysis of RNA-seq data from raw counts 
+
+Here we use data from [this study](https://www.sciencedirect.com/science/article/pii/S1472979217301889), deposited to the GEO database under the accession number [GSE89403](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE89403). 
+
+First install BiocManager, then use it to install the necessary packages (GEOquery, edgeR)
+Install some other necessary packages for analysis & visualization
+```{r}
+library(GEOquery)
+library(stringr)
+library(limma)
+library(edgeR)
+library(ggplot2)
+
+# set the working directory
+setwd('D:/defne/Documents/BC/TVO/RNAseq/HOST_ENTROPY/Dataset5_Human_Mtb/')
+```
+
+Download the GEO data file, put it in the current directory, and load it . 
+```{r}
+Human_mtb_dat <- getGEO('GSE89403', destdir=".", GSEMatrix = TRUE)
+# get the metadata associated with these samples
+metadata_table <- pData(phenoData(Human_mtb_dat[[1]]))
+```
+
+Unfortunately this imports no expression data - this can be seen by printing a summary of the Mm_ebov_dat object (assayData has 0 rows)
+```{r}
+Human_mtb_dat
+```
+
+The raw read counts for each gene/feature is provided as a supplemental table on GEO. Download the file "GSE89403_rawCounts_GeneNames_AllSamples.csv.gz" and move to the current directory and unzip. Then we can load the counts from this table
+```{r}
+Human_mtb_counts <- read.csv('GSE89403_rawCounts_GeneNames_AllSamples.csv', header=T, row.names = 1)
+
+#The first column was gene symbol. Remove that
+Human_mtb_counts <- Human_mtb_counts[,2:ncol(Human_mtb_counts)]
+
+# only keep genes (i.e. rows) for which there is more than 500 counts across all experiments
+Human_mtb_counts <- Human_mtb_counts[rowSums(Human_mtb_counts)>500, ]
+```
+
+Now we retrieve the relevant columns in the metadata table (those that specify the subject, treatment outcome, timepoint etc. Since this step is more of a "manual" curation of the data, inspect the metadata, check the study, and make the most appropriate decision for the particular dataset you are working with. 
+```{r}
+## get the relevant columns after checking metadata_table
+metadata_sub <- metadata_table[,c('title', 'geo_accession', "sample_code:ch1","subject:ch1","time:ch1", "treatmentresult:ch1",
+                                  "disease state:ch1", "xpert:ch1", "mgit:ch1", "timetonegativity:ch1")]
+
+```
+
+## Overall comparisons
+Here we will compute differential expression for the following comparisons:    
+1. treatmentresult == Definite Cure vs Disease state == Healthy controls    
+2. treatmentresult == Not Cured vs Disease state == Healthy controls    
+For each timepont (DX, day_7, week_4, week_24)
+
+```{r}
+N <- nrow(Human_mtb_counts)
+
+compare_to_healthy<- function(timepoint, outcome){
+  # define the experimental and control groups (DE will be computed as Experiment/Control)
+  infectedgroup <- metadata_sub[(metadata_sub$`treatmentresult:ch1` == outcome & 
+                                metadata_sub$`time:ch1` == timepoint  
+                                ), ]
+
+  controlgroup <- metadata_sub[(metadata_sub$`disease state:ch1` == "Healthy Controls" & 
+                                metadata_sub$`time:ch1` == timepoint
+                                ), ]
+  # make a data frame that has the groups labeles as 1 and 0
+  infectedgroup$Group <- 1
+  controlgroup$Group <- 0
+  designdf <- rbind(infectedgroup, controlgroup)
+  
+  # retrieve the expression data for the relevant samples, and turn into
+  # an expression set
+  exprdata <- Human_mtb_counts[designdf$`sample_code:ch1`]
+  ex <- ExpressionSet(assayData=as.matrix(exprdata))
+  
+  # this next section is from the limma vignettes
+  y <- DGEList(counts = exprdata)
+  y <- calcNormFactors(y)
+  
+  design <- model.matrix(~ Group, data = designdf)
+  v <- voom(y, design, plot=T)
+  fit <- lmFit(v, design)
+  fit <- eBayes(fit)
+  
+  # retrieve the differential expression for all the genes (there's N genes total)
+  DE <- topTable(fit, number = N)$logFC
+  
+  #compute entropy
+  H <- log(2*pi*exp(1)*var(DE, na.rm=T))
+  return(H)
+}
+
+population_results <- data.frame('TimeName' = rep(c('DX', 'day_7', 'week_4','week_24'),2),
+                                 'Week' = rep(c(0,1,4,24),2),
+                                 'Group' = c(rep('Definite Cure',4),rep('Not Cured',4)),
+                                 'Entropy' = NA)
+for (i in 1:10){
+  tryCatch({
+      population_results$Entropy[i] <- compare_to_healthy(population_results$TimeName[i], population_results$Group[i])
+  }, error = function(e){print(population_results[i,])}
+  )
+}
+
+population_results_complete <- population_results[complete.cases(population_results),]
+
+ggplot(population_results_complete, aes(x=Week, y=Entropy, col=Group))+geom_point()+geom_line()+theme_bw()+ggtitle('Disease vs Healthy comparison at matched timepoints')
+```
+Entropy is higher in the NOt Cured group compared to the Definite Cure group. The decrease in entropy can be explained by both cohorts being on an antibiotic regimen.      
+
+It looks like the healthy controls do not have data past week 4. So next we try to compare the infected groups to the healthy host at time = DX (i.e. week 0). Using a single reference (if it works) would also be more practical in terms of a clinical application, since we wouldn't need to collect multiple timepoints from the healthy group. 
+```{r}
+compare_to_healthy0<- function(timepoint, outcome){
+  # define the experimental and control groups (DE will be computed as Experiment/Control)
+  infectedgroup <- metadata_sub[(metadata_sub$`treatmentresult:ch1` == outcome & 
+                                metadata_sub$`time:ch1` == timepoint  
+                                ), ]
+
+  controlgroup <- metadata_sub[(metadata_sub$`disease state:ch1` == "Healthy Controls" & 
+                                metadata_sub$`time:ch1` == "DX"
+                                ), ]
+  # make a data frame that has the groups labeles as 1 and 0
+  infectedgroup$Group <- 1
+  controlgroup$Group <- 0
+  designdf <- rbind(infectedgroup, controlgroup)
+  
+  # retrieve the expression data for the relevant samples, and turn into
+  # an expression set
+  exprdata <- Human_mtb_counts[designdf$`sample_code:ch1`]
+  ex <- ExpressionSet(assayData=as.matrix(exprdata))
+  
+  # this next section is from the limma vignettes
+  y <- DGEList(counts = exprdata)
+  y <- calcNormFactors(y)
+  
+  design <- model.matrix(~ Group, data = designdf)
+  v <- voom(y, design, plot=T)
+  fit <- lmFit(v, design)
+  fit <- eBayes(fit)
+  
+  # retrieve the differential expression for all the genes (there's N genes total)
+  DE <- topTable(fit, number = N)$logFC
+  
+  #compute entropy
+  H <- log(2*pi*exp(1)*var(DE, na.rm=T))
+  return(H)
+}
+
+population_results_ref0 <- data.frame('TimeName' = rep(c('DX', 'day_7', 'week_4', 'week_24'),2),
+                                 'Week' = rep(c(0,1,4,24),2),
+                                 'Group' = c(rep('Definite Cure',4),rep('Not Cured',4)),
+                                 'Entropy' = NA)
+for (i in 1:10){
+  tryCatch({
+      population_results_ref0$Entropy[i] <- compare_to_healthy0(population_results_ref0$TimeName[i], population_results_ref0$Group[i])
+  }, error = function(e){print(population_results_ref0[i,])}
+  )
+}
+
+population_results_ref0_complete <- population_results_ref0[complete.cases(population_results_ref0),]
+
+write.csv(population_results_ref0_complete, 'Population_Entropy_vs_HealthDX.csv',row.names = F)
+
+ggplot(population_results_ref0_complete, aes(x=Week, y=Entropy, col=Group))+geom_point()+geom_line()+theme_bw()+ggtitle('Disease vs Healthy (timepoint 0) comparison')
+ggsave('Population_Entropy_vs_HealthyDX.svg', width=7, height=5)
+```
+This is looking promising! The Cure group keeps decreasing in entropy, which is expected if the bacterial infection is being cleared. Whereas the Not Cure/Relapse group increases in entropy at the end, because the bacterium is probably starting to grow again. It would be interesting if this correlated with the bacterial load of the patients too. We can use the Ct results from the clinical metadata for that
+```{r}
+population_results_ref0['Ct'] <- NA
+
+for (i in 1:8){
+  tryCatch({
+    thisgroup <- metadata_sub[(metadata_sub$`treatmentresult:ch1` == population_results_ref0$Group[i] & 
+                                metadata_sub$`time:ch1` == population_results_ref0$TimeName[i]  
+                                ), ]
+    thisgroup$`xpert:ch1` <- as.numeric(thisgroup$`xpert:ch1`)
+    thisgroup$`xpert:ch1`[is.na(thisgroup$`xpert:ch1`)]<-40
+    avgCt <- mean(thisgroup$`xpert:ch1`)
+    population_results_ref0$Ct[i] <- avgCt
+  }, error = function(e){print(population_results_ref0[i,])}
+  )
+}
+
+ggplot(population_results_ref0, aes(x=Ct, y=Entropy, col=Group))+geom_point()+theme_bw()
+ggsave('Entropy_vs_Ct.svg', width=5, height=4)
+
+ggplot(population_results_ref0, aes(x=Week, y=Ct, col=Group))+geom_point()+geom_line()+theme_bw()
+ggsave('Ct_vs_Time.svg',width=7, height=5)
+```
+So using the group averages, it does look like entropy correlated with bacterial load.
+
